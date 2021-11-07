@@ -11,13 +11,13 @@
 #import <pthread.h>
 #import <sys/xattr.h>
 
-#if SWIFT_PACKAGE
-@import PINOperation;
+#if !__has_include (<PINOperation/PINOperation.h>)
+#import "PINOperation.h"
 #else
 #import <PINOperation/PINOperation.h>
 #endif
 
-#define PINDiskCacheLogError(error) if (error) { NSLog(@"%@ (%d) ERROR: %@", \
+#define PINDiskCacheError(error) if (error) { NSLog(@"%@ (%d) ERROR: %@", \
 [[NSString stringWithUTF8String:__FILE__] lastPathComponent], \
 __LINE__, [error localizedDescription]); }
 
@@ -332,7 +332,7 @@ static NSURL *_sharedTrashURL;
         if (@available(iOS 11.0, macOS 10.13, tvOS 11.0, watchOS 4.0, *)) {
             NSError *error = nil;
             NSData *data = [NSKeyedArchiver archivedDataWithRootObject:object requiringSecureCoding:NO error:&error];
-            PINDiskCacheLogError(error);
+            PINDiskCacheError(error);
             return data;
         } else {
             return [NSKeyedArchiver archivedDataWithRootObject:object];
@@ -346,7 +346,7 @@ static NSURL *_sharedTrashURL;
         if (@available(iOS 11.0, macOS 10.13, tvOS 11.0, watchOS 4.0, *)) {
             NSError *error = nil;
             NSKeyedUnarchiver *unarchiver = [[NSKeyedUnarchiver alloc] initForReadingFromData:data error:&error];
-            PINDiskCacheLogError(error);
+            NSAssert(!error, @"unarchiver init failed with error");
             unarchiver.requiresSecureCoding = NO;
             return [unarchiver decodeObjectForKey:NSKeyedArchiveRootObjectKey];
         } else {
@@ -432,37 +432,43 @@ static NSURL *_sharedTrashURL;
 
 + (NSURL *)sharedTrashURL
 {
-    NSURL *trashURL = nil;
-    
-    [[PINDiskCache sharedLock] lock];
-        if (_sharedTrashURL == nil) {
-            NSString *uniqueString = [[NSProcessInfo processInfo] globallyUniqueString];
-            _sharedTrashURL = [[[NSURL alloc] initFileURLWithPath:NSTemporaryDirectory()] URLByAppendingPathComponent:uniqueString isDirectory:YES];
-            
-            NSError *error = nil;
-            [[NSFileManager defaultManager] createDirectoryAtURL:_sharedTrashURL
-                                     withIntermediateDirectories:YES
-                                                      attributes:nil
-                                                           error:&error];
-            PINDiskCacheLogError(error);
-        }
-        trashURL = _sharedTrashURL;
-    [[PINDiskCache sharedLock] unlock];
-    
-    return trashURL;
+    NSAssert(![[PINDiskCache sharedLock] tryLock] || ([[PINDiskCache sharedLock] unlock], NO),
+             @"+[sharedTrashURL] must be called with +[sharedLock] held.");
+    if (_sharedTrashURL == nil) {
+        NSString *uniqueString = [[NSProcessInfo processInfo] globallyUniqueString];
+        _sharedTrashURL = [[[NSURL alloc] initFileURLWithPath:NSTemporaryDirectory()] URLByAppendingPathComponent:uniqueString isDirectory:YES];
+
+        NSError *error = nil;
+        [[NSFileManager defaultManager] createDirectoryAtURL:_sharedTrashURL
+                                 withIntermediateDirectories:YES
+                                                  attributes:nil
+                                                       error:&error];
+        PINDiskCacheError(error);
+    }
+    return _sharedTrashURL;
 }
 
-+ (BOOL)moveItemAtURLToTrash:(NSURL *)itemURL
++ (BOOL)moveItemAtURLToTrashOrRemove:(NSURL *)itemURL
 {
     if (![[NSFileManager defaultManager] fileExistsAtPath:[itemURL path]])
         return NO;
     
     NSError *error = nil;
     NSString *uniqueString = [[NSProcessInfo processInfo] globallyUniqueString];
-    NSURL *uniqueTrashURL = [[PINDiskCache sharedTrashURL] URLByAppendingPathComponent:uniqueString isDirectory:NO];
-    BOOL moved = [[NSFileManager defaultManager] moveItemAtURL:itemURL toURL:uniqueTrashURL error:&error];
-    PINDiskCacheLogError(error);
-    return moved;
+
+    [[PINDiskCache sharedLock] lock];
+        NSURL *uniqueTrashURL = [[PINDiskCache sharedTrashURL] URLByAppendingPathComponent:uniqueString
+                                                                               isDirectory:NO];
+        BOOL moved = [[NSFileManager defaultManager] moveItemAtURL:itemURL toURL:uniqueTrashURL error:&error];
+    [[PINDiskCache sharedLock] unlock];
+    PINDiskCacheError(error);
+    BOOL removed = NO;
+    if (!moved) {
+        // Delete the item synchronously as a fallback.
+        removed = [[NSFileManager defaultManager] removeItemAtURL:itemURL error:&error];
+        PINDiskCacheError(error);
+    }
+    return moved || removed;
 }
 
 + (void)emptyTrash
@@ -483,7 +489,7 @@ static NSURL *_sharedTrashURL;
         if (trashURL != nil) {
             NSError *removeTrashedItemError = nil;
             [[NSFileManager defaultManager] removeItemAtURL:trashURL error:&removeTrashedItemError];
-            PINDiskCacheLogError(removeTrashedItemError);
+            PINDiskCacheError(removeTrashedItemError);
         }
     });
 }
@@ -499,7 +505,7 @@ static NSURL *_sharedTrashURL;
                                                 withIntermediateDirectories:YES
                                                                  attributes:nil
                                                                       error:&error];
-        PINDiskCacheLogError(error);
+        PINDiskCacheError(error);
     }
     
 
@@ -531,7 +537,7 @@ static NSURL *_sharedTrashURL;
     NSError *error = nil;
 
     NSDictionary *dictionary = [fileURL resourceValuesForKeys:[PINDiskCache resourceKeys] error:&error];
-    PINDiskCacheLogError(error);
+    PINDiskCacheError(error);
 
     if (_metadata[fileKey] == nil) {
         _metadata[fileKey] = [[PINDiskCacheMetadata alloc] init];
@@ -560,7 +566,7 @@ static NSURL *_sharedTrashURL;
             if (errno != ENOATTR) {
                 NSDictionary<NSErrorUserInfoKey, id> *userInfo = @{ PINDiskCacheErrorReadFailureCodeKey : @(errno)};
                 error = [NSError errorWithDomain:PINDiskCacheErrorDomain code:PINDiskCacheErrorReadFailure userInfo:userInfo];
-                PINDiskCacheLogError(error);
+                PINDiskCacheError(error);
             }
         }
     }
@@ -581,7 +587,7 @@ static NSURL *_sharedTrashURL;
                                                                             error:&error];
     [self unlock];
     
-    PINDiskCacheLogError(error);
+    PINDiskCacheError(error);
     
     for (NSURL *fileURL in files) {
         NSString *fileKey = [self keyForEncodedFileURL:fileURL];
@@ -627,7 +633,7 @@ static NSURL *_sharedTrashURL;
     BOOL success = [[NSFileManager defaultManager] setAttributes:@{ NSFileModificationDate: date }
                                                     ofItemAtPath:[fileURL path]
                                                            error:&error];
-    PINDiskCacheLogError(error);
+    PINDiskCacheError(error);
     
     return success;
 }
@@ -654,14 +660,14 @@ static NSURL *_sharedTrashURL;
           if (errno != ENOATTR) {
             NSDictionary<NSErrorUserInfoKey, id> *userInfo = @{ PINDiskCacheErrorWriteFailureCodeKey : @(errno)};
             error = [NSError errorWithDomain:PINDiskCacheErrorDomain code:PINDiskCacheErrorWriteFailure userInfo:userInfo];
-            PINDiskCacheLogError(error);
+            PINDiskCacheError(error);
           }
         }
     } else {
         if (setxattr(PINDiskCacheFileSystemRepresentation(fileURL), PINDiskCacheAgeLimitAttributeName, &ageLimit, sizeof(NSTimeInterval), 0, 0) != 0) {
             NSDictionary<NSErrorUserInfoKey, id> *userInfo = @{ PINDiskCacheErrorWriteFailureCodeKey : @(errno)};
             error = [NSError errorWithDomain:PINDiskCacheErrorDomain code:PINDiskCacheErrorWriteFailure userInfo:userInfo];
-            PINDiskCacheLogError(error);
+            PINDiskCacheError(error);
         }
     }
 
@@ -696,7 +702,7 @@ static NSURL *_sharedTrashURL;
             [self lock];
         }
         
-        BOOL trashed = [PINDiskCache moveItemAtURLToTrash:fileURL];
+        BOOL trashed = [PINDiskCache moveItemAtURLToTrashOrRemove:fileURL];
         if (!trashed) {
             [self unlock];
             return NO;
@@ -1110,7 +1116,7 @@ static NSURL *_sharedTrashURL;
                   [self lock];
                       [[NSFileManager defaultManager] removeItemAtPath:[fileURL path] error:&error];
                   [self unlock];
-                  PINDiskCacheLogError(error)
+                  PINDiskCacheError(error)
                   PINDiskCacheException(exception);
               }
               [self lock];
@@ -1228,7 +1234,7 @@ static NSURL *_sharedTrashURL;
     
         NSError *writeError = nil;
         BOOL written = [data writeToURL:fileURL options:writeOptions error:&writeError];
-        PINDiskCacheLogError(writeError);
+        PINDiskCacheError(writeError);
         
         if (written) {
             if (_metadata[key] == nil) {
@@ -1237,7 +1243,7 @@ static NSURL *_sharedTrashURL;
             
             NSError *error = nil;
             NSDictionary *values = [fileURL resourceValuesForKeys:@[ NSURLCreationDateKey, NSURLContentModificationDateKey, NSURLTotalFileAllocatedSizeKey ] error:&error];
-            PINDiskCacheLogError(error);
+            PINDiskCacheError(error);
             
             NSNumber *diskFileSize = [values objectForKey:NSURLTotalFileAllocatedSizeKey];
             if (diskFileSize) {
@@ -1361,7 +1367,7 @@ static NSURL *_sharedTrashURL;
             [self lock];
         }
     
-        [PINDiskCache moveItemAtURLToTrash:self->_cacheURL];
+        [PINDiskCache moveItemAtURLToTrashOrRemove:self->_cacheURL];
         [PINDiskCache emptyTrash];
         
         [self _locked_createCacheDirectory];
